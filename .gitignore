@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.dist-info/
+.pytest_cache/
+.hypothesis/
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment
+.env
+.env.local
+
+# CDK
+cdk/cdk.out/
+
+# AgentCore CLI
+agent/.bedrock_agentcore/
+agent/.bedrock_agentcore.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Generated diagrams
+generated-diagrams/
+
+# Vendored Lambda dependencies (installed via scripts/install-lambda-deps.sh)
+cdk/lambdas/gateway_custom_resource/boto3/
+cdk/lambdas/gateway_custom_resource/botocore/
+cdk/lambdas/gateway_custom_resource/s3transfer/
+cdk/lambdas/gateway_custom_resource/dateutil/
+cdk/lambdas/gateway_custom_resource/urllib3/
+cdk/lambdas/gateway_custom_resource/jmespath/
+cdk/lambdas/gateway_custom_resource/six.py
+cdk/lambdas/gateway_custom_resource/bin/
+tool-lambdas/return-label-generator/fpdf/
+tool-lambdas/issue-refund/fpdf/
+agent/.bedrock_agentcore.yaml
+
+# Demo workspace
+demo/
+
+blog/
+
+# Blog drafts
+blog/
