@@ -2,24 +2,23 @@
 Production-ready AI Agent with layered safety controls.
 
 Architecture: Cognito → API Gateway (REST, OAuth) → AgentCore Runtime (OAuth)
-              → AgentCore Gateway (CUSTOM_JWT, interceptor, Cedar) → Tool Lambdas
+              → AgentCore Gateway (CUSTOM_JWT, interceptor, Dogwood/Cedar policies)
+              → Tool Lambdas
               + AgentCore Memory, Bedrock Guardrails, WAF
 """
 from aws_cdk import (
-    BundlingOptions, CfnOutput, CfnResource, DockerImage, Duration, Fn,
+    BundlingOptions, CfnOutput, DockerImage, Duration, Fn,
     Stack, RemovalPolicy,
     aws_apigateway as apigw,
     aws_bedrock as bedrock,
-    aws_bedrockagentcore as bac,
+    aws_bedrockagentcore as agentcore,
     aws_cognito as cognito,
     aws_dynamodb as dynamodb,
     aws_iam as iam,
     aws_lambda as lambda_,
     aws_s3 as s3,
-    aws_s3_assets as s3_assets,
     aws_wafv2 as wafv2,
 )
-import aws_cdk.aws_bedrock_agentcore_alpha as agentcore
 from constructs import Construct
 import json, os
 
@@ -65,13 +64,13 @@ class ProductionAgentGuardrailsStack(Stack):
         # ── Storage ───────────────────────────────────────────────────────────
 
         self.return_labels_bucket = s3.Bucket(self, "ReturnLabelsBucket",
-            bucket_name="robot-vacuum-return-labels",
+            bucket_name=f"robot-vacuum-return-labels-{self.account}",
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL, versioned=True,
             removal_policy=RemovalPolicy.DESTROY, auto_delete_objects=True,
             lifecycle_rules=[s3.LifecycleRule(id="Expire30d", enabled=True, expiration=Duration.days(30))],
         )
         self.transcripts_bucket = s3.Bucket(self, "TranscriptsBucket",
-            bucket_name="customer-service-transcripts-mw",
+            bucket_name=f"customer-service-transcripts-{self.account}",
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL, versioned=True,
             removal_policy=RemovalPolicy.DESTROY, auto_delete_objects=True,
         )
@@ -181,6 +180,11 @@ class ProductionAgentGuardrailsStack(Stack):
         )
         for fn in all_tools:
             fn.grant_invoke(gw_role)
+        # Temporal (Dogwood) policies correlate actions across a session via the
+        # Workload Access Token — the gateway role must be able to fetch it
+        gw_role.add_to_policy(iam.PolicyStatement(
+            actions=["bedrock-agentcore:GetWorkloadAccessToken"],
+            resources=[f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:workload-identity-directory/*"]))
 
         # Interceptor Lambda — customer ID mismatch detection
         self.interceptor_fn = lambda_.Function(self, "Interceptor",
@@ -188,152 +192,158 @@ class ProductionAgentGuardrailsStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12, handler="handler.lambda_handler",
             code=lambda_.Code.from_asset(os.path.join(_lambdas, "gateway_interceptor")),
             timeout=Duration.seconds(30), memory_size=128)
-        self.interceptor_fn.grant_invoke(gw_role)
 
-        # ── Cedar Policy Engine (must be created before gateway) ──────────
+        # ── Policy Engine (must be created before gateway) ─────────────────
 
-        self.policy_engine = bac.CfnPolicyEngine(self, "PolicyEngine",
-            name="refund_policy_engine",
-            description="Cedar policy engine for customer service tool authorization",
+        self.policy_engine = agentcore.PolicyEngine(self, "PolicyEngine",
+            policy_engine_name="refund_policy_engine",
+            description="Dogwood/Cedar policy engine for customer service tool authorization",
         )
 
-        self.gateway = bac.CfnGateway(self, "Gateway",
-            name="customer-service-agent-gateway",
-            protocol_type="MCP",
-            role_arn=gw_role.role_arn,
-            authorizer_type="CUSTOM_JWT",
-            authorizer_configuration=bac.CfnGateway.AuthorizerConfigurationProperty(
-                custom_jwt_authorizer=bac.CfnGateway.CustomJWTAuthorizerConfigurationProperty(
-                    discovery_url=f"{_cognito_issuer}/{self.user_pool.user_pool_id}/.well-known/openid-configuration",
-                    allowed_audience=[self.app_client.user_pool_client_id],
-                ),
+        self.gateway = agentcore.Gateway(self, "Gateway",
+            gateway_name="customer-service-agent-gateway",
+            role=gw_role,
+            authorizer_configuration=agentcore.GatewayAuthorizer.using_custom_jwt(
+                discovery_url=f"{_cognito_issuer}/{self.user_pool.user_pool_id}/.well-known/openid-configuration",
+                allowed_audience=[self.app_client.user_pool_client_id],
             ),
             interceptor_configurations=[
-                bac.CfnGateway.GatewayInterceptorConfigurationProperty(
-                    interception_points=["REQUEST"],
-                    interceptor=bac.CfnGateway.InterceptorConfigurationProperty(
-                        lambda_=bac.CfnGateway.LambdaInterceptorConfigurationProperty(
-                            arn=self.interceptor_fn.function_arn)),
-                    input_configuration=bac.CfnGateway.InterceptorInputConfigurationProperty(
-                        pass_request_headers=True),
-                ),
+                agentcore.LambdaInterceptor.for_request(
+                    self.interceptor_fn, pass_request_headers=True),
             ],
-            exception_level="DEBUG",
-            policy_engine_configuration=bac.CfnGateway.GatewayPolicyEngineConfigurationProperty(
-                arn=self.policy_engine.attr_policy_engine_arn,
-                mode="ENFORCE",
+            exception_level=agentcore.GatewayExceptionLevel.DEBUG,
+            policy_engine_configuration=agentcore.GatewayPolicyEngineConfig(
+                policy_engine=self.policy_engine,
+                mode=agentcore.PolicyEngineMode.ENFORCE,
             ),
         )
 
-        # ── Gateway Targets (native L1) ────────────────────────────────────
+        # ── Gateway Targets (L2 addLambdaTarget) ───────────────────────────
 
-        _cred = [bac.CfnGatewayTarget.CredentialProviderConfigurationProperty(
-            credential_provider_type="GATEWAY_IAM_ROLE")]
+        _obj = agentcore.SchemaDefinitionType.OBJECT
+        _str = agentcore.SchemaDefinitionType.STRING
+        _int = agentcore.SchemaDefinitionType.INTEGER
+        _num = agentcore.SchemaDefinitionType.NUMBER
 
-        def _mcp_lambda_target(lid, name, desc, fn, tools_schema):
-            t = bac.CfnGatewayTarget(self, lid,
-                name=name, description=desc,
-                gateway_identifier=self.gateway.attr_gateway_identifier,
-                target_configuration=bac.CfnGatewayTarget.TargetConfigurationProperty(
-                    mcp=bac.CfnGatewayTarget.McpTargetConfigurationProperty(
-                        lambda_=bac.CfnGatewayTarget.McpLambdaTargetConfigurationProperty(
-                            lambda_arn=fn.function_arn,
-                            tool_schema=bac.CfnGatewayTarget.ToolSchemaProperty(
-                                inline_payload=tools_schema)))),
-                credential_provider_configurations=_cred)
-            t.add_dependency(self.gateway)
+        self._targets = []
+
+        def _lambda_target(lid, name, desc, fn, tool_desc, properties, required):
+            t = self.gateway.add_lambda_target(lid,
+                gateway_target_name=name, description=desc,
+                lambda_function=fn,
+                tool_schema=agentcore.ToolSchema.from_inline([
+                    agentcore.ToolDefinition(
+                        name=name, description=tool_desc,
+                        input_schema=agentcore.SchemaDefinition(
+                            type=_obj, properties=properties, required=required)),
+                ]))
+            self._targets.append(t)
             return t
 
-        _mcp_lambda_target("TargetOrderLookup", "order-lookup-tool", "Customer Order Lookup Tool",
-            self.order_lookup_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="order-lookup-tool", description="Tool to look up a customer's order by order ID.",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={"orderId": {"type": "string", "description": "The order ID to look up"}},
-                    required=["orderId"]))])
+        _lambda_target("TargetOrderLookup", "order-lookup-tool", "Customer Order Lookup Tool",
+            self.order_lookup_fn, "Tool to look up a customer's order by order ID.",
+            {"orderId": agentcore.SchemaDefinition(type=_str, description="The order ID to look up")},
+            ["orderId"])
 
-        _mcp_lambda_target("TargetWarrantyLookup", "warranty-lookup-tool", "Order Warranty Lookup Tool",
-            self.warranty_lookup_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="warranty-lookup-tool", description="Tool to look up warranty information for an order",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={"orderId": {"type": "string"}},
-                    required=["orderId"]))])
+        _lambda_target("TargetWarrantyLookup", "warranty-lookup-tool", "Order Warranty Lookup Tool",
+            self.warranty_lookup_fn, "Tool to look up warranty information for an order",
+            {"orderId": agentcore.SchemaDefinition(type=_str)},
+            ["orderId"])
 
-        _mcp_lambda_target("TargetReturnLabel", "return-label-generator", "Return Label Generator Tool",
-            self.return_label_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="return-label-generator",
-                description="Tool to generate a return shipping label for an order. The refund is processed automatically when the item is received. Requires orderId and amount (integer, the order total).",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={
-                        "orderId": {"type": "string", "description": "The order ID"},
-                        "amount": {"type": "integer", "description": "The order total amount in dollars (integer)"}},
-                    required=["orderId", "amount"]))])
+        _lambda_target("TargetReturnLabel", "return-label-generator", "Return Label Generator Tool",
+            self.return_label_fn,
+            "Tool to generate a return shipping label for an order. The refund is processed automatically when the item is received. Requires orderId and amount (the order total in dollars, e.g. 249.99).",
+            {"orderId": agentcore.SchemaDefinition(type=_str, description="The order ID"),
+             "amount": agentcore.SchemaDefinition(type=_num, description="The order total amount in dollars (e.g. 249.99)")},
+            ["orderId", "amount"])
 
-        _mcp_lambda_target("TargetPolicyLookup", "company-policy-lookup", "Company Policy Lookup Tool",
-            self.policy_lookup_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="company-policy-lookup", description="Tool to look up company policy information",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={"query": {"type": "string"}},
-                    required=["query"]))])
+        _lambda_target("TargetPolicyLookup", "company-policy-lookup", "Company Policy Lookup Tool",
+            self.policy_lookup_fn, "Tool to look up company policy information",
+            {"query": agentcore.SchemaDefinition(type=_str)},
+            ["query"])
 
-        _mcp_lambda_target("TargetCheckEligibility", "check-return-eligibility-tool", "Check Return Eligibility Tool",
-            self.check_eligibility_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="check-return-eligibility-tool", description="Tool to check whether an order is eligible for return",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={"order_id": {"type": "string"}},
-                    required=["order_id"]))])
+        _lambda_target("TargetCheckEligibility", "check-return-eligibility-tool", "Check Return Eligibility Tool",
+            self.check_eligibility_fn, "Tool to check whether an order is eligible for return",
+            {"order_id": agentcore.SchemaDefinition(type=_str)},
+            ["order_id"])
 
-        _mcp_lambda_target("TargetCreateCase", "create-case-tool", "Create Escalation Case Tool",
-            self.create_case_fn, [bac.CfnGatewayTarget.ToolDefinitionProperty(
-                name="create-case-tool", description="Tool to create a customer service escalation case",
-                input_schema=bac.CfnGatewayTarget.SchemaDefinitionProperty(
-                    type="object", properties={"reason": {"type": "string"}},
-                    required=["reason"]))])
+        _lambda_target("TargetCreateCase", "create-case-tool", "Create Escalation Case Tool",
+            self.create_case_fn, "Tool to create a customer service escalation case",
+            {"reason": agentcore.SchemaDefinition(type=_str)},
+            ["reason"])
 
-        # ── Cedar Policies (native L1) ───────────────────────────────────
+        # ── Dogwood / Cedar Policies ─────────────────────────────────────
+        #
+        # Dogwood is a superset of Cedar: every Cedar policy is a valid Dogwood
+        # policy, and Dogwood adds *temporal* operators that evaluate the
+        # session's history, not just the current request. Deny-by-default:
+        # a tool call is allowed only if a permit matches and no forbid overrides.
 
-        _gw_arn = Fn.sub(
-            "arn:aws:bedrock-agentcore:${Region}:${AccountId}:gateway/${GwId}",
-            {"Region": self.region, "AccountId": self.account,
-             "GwId": self.gateway.attr_gateway_identifier})
+        _gw_arn = self.gateway.gateway_arn
 
-        # Broad permit for all authenticated users (IGNORE_ALL_FINDINGS to bypass overly-permissive check)
-        permit_all = bac.CfnPolicy(self, "PermitAllTools",
-            name="permit_all_other_tools",
-            policy_engine_id=self.policy_engine.attr_policy_engine_id,
-            description="Allow all authenticated users to call any tool",
-            definition=bac.CfnPolicy.PolicyDefinitionProperty(
-                cedar=bac.CfnPolicy.CedarPolicyProperty(
-                    statement=Fn.sub(
-                        'permit(principal is AgentCore::OAuthUser, action, resource == AgentCore::Gateway::"${GwArn}");',
-                        {"GwArn": _gw_arn}))),
-            validation_mode="IGNORE_ALL_FINDINGS",
+        # Permit the read/escalation tools for any authenticated user.
+        # return-label-generator is deliberately NOT in this list — its only
+        # permit is the temporal policy below.
+        # The engine validates each policy's actions against the gateway's tool
+        # schema, so every policy must be created after the targets exist.
+        permit_customer_tools = agentcore.Policy(self, "PermitCustomerTools",
+            policy_engine=self.policy_engine,
+            policy_name="permit_customer_tools",
+            description="Allow authenticated users to call the read and escalation tools",
+            statement=agentcore.PolicyStatement.from_cedar(
+                'permit(principal is AgentCore::OAuthUser, action in ['
+                'AgentCore::Action::"order-lookup-tool___order-lookup-tool", '
+                'AgentCore::Action::"warranty-lookup-tool___warranty-lookup-tool", '
+                'AgentCore::Action::"company-policy-lookup___company-policy-lookup", '
+                'AgentCore::Action::"check-return-eligibility-tool___check-return-eligibility-tool", '
+                'AgentCore::Action::"create-case-tool___create-case-tool"'
+                f'], resource == AgentCore::Gateway::"{_gw_arn}");'),
+            validation_mode=agentcore.PolicyValidationMode.IGNORE_ALL_FINDINGS,
         )
 
-        # Permit return labels under $500
-        permit_labels = bac.CfnPolicy(self, "PermitReturnLabelsUnder500",
-            name="permit_return_labels_under_500",
-            policy_engine_id=self.policy_engine.attr_policy_engine_id,
-            description="Allow return labels for orders under 500 dollars",
-            definition=bac.CfnPolicy.PolicyDefinitionProperty(
-                cedar=bac.CfnPolicy.CedarPolicyProperty(
-                    statement=Fn.sub(
-                        'permit(principal, action == AgentCore::Action::"return-label-generator___return-label-generator", resource == AgentCore::Gateway::"${GwArn}") when { context.input.amount < 500 };',
-                        {"GwArn": _gw_arn}))),
+        # Temporal (Dogwood) permit: a return label is allowed only when
+        #   1. the amount is under $500 (point-in-time Cedar condition), AND
+        #   2. a check-return-eligibility call for the SAME order completed
+        #      successfully earlier in this policy session (temporal condition).
+        # The agent's system prompt asks for this ordering; this policy enforces it.
+        # Temporal statements go under definition.policy (not definition.cedar),
+        # which the Policy L2 does not model yet — so this one uses the L1.
+        permit_labels = agentcore.CfnPolicy(self, "PermitReturnLabelsWithEligibility",
+            name="permit_return_labels_with_eligibility",
+            policy_engine_id=self.policy_engine.policy_engine_id,
+            description="Allow return labels under 500 dollars only after a successful eligibility check for the same order in this session",
+            definition=agentcore.CfnPolicy.PolicyDefinitionProperty(
+                policy=agentcore.CfnPolicy.PolicyStatementProperty(
+                    statement=(
+                        'permit(principal, '
+                        'action == AgentCore::Action::"return-label-generator___return-label-generator", '
+                        f'resource == AgentCore::Gateway::"{_gw_arn}") '
+                        'when { context.input.amount.lessThan(decimal("500.0")) && temporal { '
+                        'formerly within 1h '
+                        'AgentCore::Action::"check-return-eligibility-tool___check-return-eligibility-tool"::response{ '
+                        'eventResource: resource, '
+                        'input.order_id: context.input.orderId } } };'
+                    ))),
         )
 
-        # Forbid return labels >= $500 — must be created AFTER the permits
-        forbid_labels = bac.CfnPolicy(self, "ForbidReturnLabelsOver500",
-            name="forbid_return_labels_over_500",
-            policy_engine_id=self.policy_engine.attr_policy_engine_id,
+        # Forbid return labels >= $500 — forbid always overrides permit.
+        # Must be created AFTER the permits (service rejects a forbid that
+        # would make the policy set overly restrictive).
+        forbid_labels = agentcore.Policy(self, "ForbidReturnLabelsOver500",
+            policy_engine=self.policy_engine,
+            policy_name="forbid_return_labels_over_500",
             description="Block return labels for orders 500 dollars or more — must escalate to human",
-            definition=bac.CfnPolicy.PolicyDefinitionProperty(
-                cedar=bac.CfnPolicy.CedarPolicyProperty(
-                    statement=Fn.sub(
-                        'forbid(principal, action == AgentCore::Action::"return-label-generator___return-label-generator", resource == AgentCore::Gateway::"${GwArn}") when { context.input.amount >= 500 };',
-                        {"GwArn": _gw_arn}))),
+            statement=agentcore.PolicyStatement.from_cedar(
+                'forbid(principal, '
+                'action == AgentCore::Action::"return-label-generator___return-label-generator", '
+                f'resource == AgentCore::Gateway::"{_gw_arn}") '
+                'when { context.input.amount.greaterThanOrEqual(decimal("500.0")) };'),
         )
-        forbid_labels.add_dependency(permit_all)
-        forbid_labels.add_dependency(permit_labels)
+        for _policy in (permit_customer_tools, permit_labels, forbid_labels):
+            for _t in self._targets:
+                _policy.node.add_dependency(_t)
+        forbid_labels.node.add_dependency(permit_customer_tools)
+        forbid_labels.node.add_dependency(permit_labels)
 
         # ── AgentCore Memory ──────────────────────────────────────────────────
 
@@ -341,53 +351,14 @@ class ProductionAgentGuardrailsStack(Stack):
             role_name="BedrockAgentCoreMemoryExecutionRole",
             assumed_by=iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
         )
-        self.memory = bac.CfnMemory(self, "Memory",
-            name="robot_vacuum_memory",
-            event_expiry_duration=90,
-            memory_execution_role_arn=mem_role.role_arn,
+        self.memory = agentcore.Memory(self, "Memory",
+            memory_name="robot_vacuum_memory",
+            expiration_duration=Duration.days(90),
+            execution_role=mem_role,
             description="Conversation memory for robot vacuum customer service agent",
         )
 
         # ── AgentCore Runtime ─────────────────────────────────────────────────
-
-        rt_role = iam.Role(self, "RuntimeRole",
-            role_name="BedrockAgentCoreRuntimeExecutionRole",
-            assumed_by=iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
-        )
-        # Bedrock model invocation (scoped to account/region)
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:ApplyGuardrail"],
-            resources=[
-                f"arn:aws:bedrock:{self.region}::foundation-model/*",
-                f"arn:aws:bedrock:{self.region}:{self.account}:guardrail/*",
-            ]))
-        # CloudWatch logs (scoped to agentcore log groups)
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-            resources=[f"arn:aws:logs:{self.region}:{self.account}:log-group:/aws/bedrock-agentcore/*"]))
-        # SSM parameters (scoped to our namespace)
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["ssm:GetParameter", "ssm:GetParameters"],
-            resources=[f"arn:aws:ssm:{self.region}:{self.account}:parameter/robot-vacuum/*"]))
-        # AgentCore memory and gateway access
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["bedrock-agentcore:InvokeGateway", "bedrock-agentcore:CreateEvent",
-                     "bedrock-agentcore:GetMemory", "bedrock-agentcore:ListEvents",
-                     "bedrock-agentcore:CreateSession", "bedrock-agentcore:GetSession"],
-            resources=[
-                f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:gateway/*",
-                f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:memory/*",
-            ]))
-        # X-Ray tracing for observability
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["xray:PutTraceSegments", "xray:PutTelemetryRecords",
-                     "xray:GetSamplingRules", "xray:GetSamplingTargets"],
-            resources=[f"arn:aws:xray:{self.region}:{self.account}:*"]))
-        # CloudWatch metrics for observability
-        rt_role.add_to_policy(iam.PolicyStatement(
-            actions=["cloudwatch:PutMetricData"],
-            resources=["*"],
-            conditions={"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}}))
 
         # Read the create_zip script for Docker bundling
         _scripts = os.path.join(os.path.dirname(__file__), "..", "scripts")
@@ -432,15 +403,13 @@ PYEOF
                 "AWS_REGION_NAME": self.region,
             },
         )
-        # Force the logical ID to match the old CfnResource
-        self.runtime.node.default_child.override_logical_id("Runtime")
         # Grant Bedrock model access (scoped to specific model and guardrail)
         # Cross-region inference profiles route to multiple regions
         self.runtime.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
             resources=[
-                f"arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0",
-                f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0",
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5",
+                f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-sonnet-5",
             ]))
         self.runtime.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock:ApplyGuardrail"],
@@ -452,10 +421,13 @@ PYEOF
         self.runtime.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter", "ssm:GetParameters"],
             resources=[f"arn:aws:ssm:{self.region}:{self.account}:parameter/robot-vacuum/*"]))
-        # AgentCore memory and gateway (scoped to specific resources)
+        # AgentCore memory and gateway (scoped to specific resources).
+        # DeleteEvent: the Strands context manager compresses conversation
+        # history by rewriting memory events (delete old + create new).
         self.runtime.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:InvokeGateway", "bedrock-agentcore:CreateEvent",
                      "bedrock-agentcore:GetMemory", "bedrock-agentcore:ListEvents",
+                     "bedrock-agentcore:DeleteEvent",
                      "bedrock-agentcore:CreateSession", "bedrock-agentcore:GetSession"],
             resources=[
                 f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:gateway/*",
@@ -471,13 +443,13 @@ PYEOF
         from aws_cdk import aws_ssm as ssm
         ssm.StringParameter(self, "SSMGatewayUrl",
             parameter_name="/robot-vacuum/gateway-url",
-            string_value=self.gateway.attr_gateway_url)
+            string_value=self.gateway.gateway_url)
         ssm.StringParameter(self, "SSMGuardrailId",
             parameter_name="/robot-vacuum/guardrail-id",
             string_value=self.guardrail.attr_guardrail_id)
         ssm.StringParameter(self, "SSMMemoryId",
             parameter_name="/robot-vacuum/memory-id",
-            string_value=self.memory.attr_memory_id)
+            string_value=self.memory.memory_id)
 
         # ── BFF Lambda (IAM auth to AgentCore Runtime) ─────────────────────
 
@@ -489,22 +461,15 @@ PYEOF
             timeout=Duration.minutes(2),
             memory_size=256,
             environment={
-                "AGENTCORE_RUNTIME_ARN": Fn.sub(
-                    "arn:aws:bedrock-agentcore:${Region}:${AccountId}:runtime/${RuntimeId}",
-                    {"Region": self.region, "AccountId": self.account,
-                     "RuntimeId": self.runtime.agent_runtime_id}),
+                "AGENTCORE_RUNTIME_ARN": self.runtime.agent_runtime_arn,
             },
         )
         # IAM permission to invoke the runtime
         self.bff_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:InvokeAgentRuntime"],
             resources=[
-                Fn.sub("arn:aws:bedrock-agentcore:${Region}:${AccountId}:runtime/${RuntimeId}",
-                    {"Region": self.region, "AccountId": self.account,
-                     "RuntimeId": self.runtime.agent_runtime_id}),
-                Fn.sub("arn:aws:bedrock-agentcore:${Region}:${AccountId}:runtime/${RuntimeId}/*",
-                    {"Region": self.region, "AccountId": self.account,
-                     "RuntimeId": self.runtime.agent_runtime_id}),
+                self.runtime.agent_runtime_arn,
+                f"{self.runtime.agent_runtime_arn}/*",
             ]))
 
         # ── REST API Gateway (Cognito auth → BFF Lambda) ─────────────────
@@ -601,5 +566,5 @@ PYEOF
         CfnOutput(self, "CognitoDomain",
             value=f"https://robot-vacuum-{self.account}.auth.{self.region}.amazoncognito.com")
         CfnOutput(self, "RuntimeId", value=self.runtime.agent_runtime_id)
-        CfnOutput(self, "GatewayId", value=self.gateway.attr_gateway_identifier)
-        CfnOutput(self, "PolicyEngineId", value=self.policy_engine.attr_policy_engine_id)
+        CfnOutput(self, "GatewayId", value=self.gateway.gateway_id)
+        CfnOutput(self, "PolicyEngineId", value=self.policy_engine.policy_engine_id)

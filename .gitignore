@@ -42,8 +42,13 @@ cdk/lambdas/gateway_custom_resource/urllib3/
 cdk/lambdas/gateway_custom_resource/jmespath/
 cdk/lambdas/gateway_custom_resource/six.py
 cdk/lambdas/gateway_custom_resource/bin/
-tool-lambdas/return-label-generator/fpdf/
-tool-lambdas/issue-refund/fpdf/
+# Vendored Lambda dependencies (scripts/install-lambda-deps.sh) — keep only source
+tool-lambdas/return-label-generator/*
+!tool-lambdas/return-label-generator/lambda_function.py
+!tool-lambdas/return-label-generator/requirements.txt
+tool-lambdas/issue-refund/*
+!tool-lambdas/issue-refund/lambda_function.py
+!tool-lambdas/issue-refund/requirements.txt
 agent/.bedrock_agentcore.yaml
 
 # Demo workspace

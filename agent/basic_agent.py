@@ -5,7 +5,7 @@ from strands.tools.mcp import MCPClient
 from mcp.client.streamable_http import streamablehttp_client
 
 # Create model instance for agent
-model = BedrockModel(model_id="us.anthropic.claude-sonnet-4-20250514-v1:0")
+model = BedrockModel(model_id="us.anthropic.claude-sonnet-5")
 
 # Connect to MCP server(s) for tools
 mcp = MCPClient(lambda: streamablehttp_client(mcp_server_url, headers={"Authorization": f"Bearer {token}"}))
