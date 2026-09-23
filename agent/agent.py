@@ -7,7 +7,6 @@ import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, RequestContext
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
-from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp.mcp_client import MCPClient
@@ -96,7 +95,7 @@ def get_model():
         cfg = load_config()
         guardrail_id = cfg.get("guardrail-id", "")
         _model = BedrockModel(
-            model_id="us.anthropic.claude-sonnet-4-20250514-v1:0",
+            model_id="us.anthropic.claude-sonnet-5",
             region_name="us-east-1",
             guardrail_id=guardrail_id if guardrail_id else None,
             guardrail_version="DRAFT" if guardrail_id else None,
@@ -130,6 +129,7 @@ def create_agent(tools, session_id, actor_id):
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
         session_manager=session_manager,
+        context_manager="auto",
         plugins=[CustomerServiceSteeringHandler()],
     )
 
@@ -161,12 +161,12 @@ def invoke(payload, context: RequestContext = None):
     gateway_url = load_config().get("gateway-url", "")
 
     try:
-        mcp_client = MCPClient(
-            lambda: streamablehttp_client(
-                gateway_url,
-                headers={"Authorization": f"Bearer {access_token}"} if access_token else {},
-            )
-        )
+        # The policy session header scopes Dogwood temporal policies to this
+        # conversation — the gateway requires it once a temporal policy exists
+        gateway_headers = {"x-amzn-bedrock-agentcore-policy-session-id": session_id}
+        if access_token:
+            gateway_headers["Authorization"] = f"Bearer {access_token}"
+        mcp_client = MCPClient(url=gateway_url, headers=gateway_headers)
         with mcp_client:
             tools = mcp_client.list_tools_sync()
             logger.info("Loaded %d tools: %s", len(tools), [t.tool_name for t in tools])

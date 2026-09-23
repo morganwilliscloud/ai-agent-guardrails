@@ -3,7 +3,7 @@ import os
 from typing import Any
 
 from strands import Agent
-from strands.experimental.steering import SteeringHandler, Proceed, Guide
+from strands.vended_plugins.steering import SteeringHandler, Proceed, Guide
 from strands.models import BedrockModel
 from strands.types.content import Message
 from strands.types.streaming import StopReason
@@ -50,7 +50,7 @@ class CustomerServiceSteeringHandler(SteeringHandler):
         self.max_retries = max_retries
         self.retry_count = 0
         self.reviewer_model = BedrockModel(
-            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5"),
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
         )
 
