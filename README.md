@@ -127,19 +127,6 @@ fails eligibility):
 DEMO_PASSWORD='<PASSWORDHERE>' ./scripts/post-deploy-setup.sh
 ```
 
-## End-to-End Tests
-
-`scripts/e2e_test.py` exercises every path: Cognito auth, direct gateway MCP calls that
-verify the policy engine deterministically (temporal ordering, per-order correlation,
-the >=$500 forbid, the mandatory policy-session header, the ownership interceptor), and
-full agent conversations through API Gateway → BFF → Runtime:
-
-```bash
-pip install strands-agents boto3 httpx
-DEMO_PASSWORD='<PASSWORDHERE>' python3 scripts/e2e_test.py            # everything
-DEMO_PASSWORD='<PASSWORDHERE>' python3 scripts/e2e_test.py --skip-agent   # policy tests only, fast
-```
-
 <details>
 <summary>Manual post-deploy setup (equivalent to the script)</summary>
 
