@@ -90,6 +90,75 @@ check amounts and eligibility history, and the Lambda checks ownership against
 the authenticated customer. Box's local policy and Gateway's policy engine have
 separate histories. This sample keeps return sequencing in Gateway.
 
+### Where should Dogwood policies run: Gateway, Box, or both?
+
+Put shared business rules at AgentCore Gateway and restrictions specific to an
+agent's environment at Box. Use both when the agent needs a restricted local
+environment and access to shared remote tools. Choose based on where a rule
+can be enforced and which events it needs to see.
+
+Here, **AgentCore Gateway** is the remote MCP endpoint in front of the tool
+Lambdas. **Box's egress gateway** is the trusted proxy beside the sandboxed
+agent, inside Runtime. These are separate enforcement points. A request must
+pass each one it crosses; a permit at Box does not override a Gateway denial.
+
+| Requirement | Put the rule here | Why |
+|------------|-------------------|-----|
+| Every caller using the customer Gateway must follow the same return amount limit and check-before-label sequence | AgentCore Gateway | The rule is enforced before remote tool invocation, including for clients that do not run in Box. Keep direct invocation of the underlying tools restricted with IAM. |
+| This agent may contact only its model, memory resource, and customer Gateway | Box | It controls the sandbox's outgoing connections and HTTP requests, including traffic that never goes through AgentCore Gateway. |
+| This agent may use a narrower subset of a remote MCP server's tools or arguments | Box with MCP mediation | The agent operator can impose an additional local restriction without changing the server's policy for everyone. Box supports this for remote HTTP MCP as well as local stdio MCP. |
+| A local MCP tool, mediated shell command, or mediated file operation needs a rule | Box | These operations do not pass through AgentCore Gateway. Direct filesystem access still depends on OS grants, not a Dogwood decision for every read or write. |
+| A rule needs an earlier remote tool call from a previous conversation turn | AgentCore Gateway in this sample | The agent forwards the same Gateway policy session ID across turns; each turn gets fresh Box state. |
+| A rule combines local activity with a later remote call | Box, with both operations mediated and suitable history retention | Gateway cannot see a local command or file operation. Box must actually record the events the rule references. This sample does not implement such a workflow. |
+| An order must belong to the authenticated customer, or a return must still be valid in the database | The trusted tool/backend, alongside IAM and Gateway policies | These checks need authoritative identity and current resource state. A caller-supplied argument or earlier policy event is not a replacement. |
+
+**The split implemented here:** [`agent/box_policy.dw`](agent/box_policy.dw)
+allows HTTPS requests to specific routes; the Box launcher configures credential
+injection outside the agent process. The policies in
+[`cdk/stacks/main_stack.py`](cdk/stacks/main_stack.py) authorize named Gateway
+tools, require a return amount below $500, and require an earlier eligibility
+check response for the same order within one hour. Tool Lambdas check ownership
+and verify the submitted amount against the stored order total.
+
+For example, an order lookup first passes Box's destination and route checks,
+then Gateway's tool policy, then the Lambda's ownership check. Sending customer
+data to an unrelated website is stopped at Box. Calling the label tool before
+the required eligibility check is stopped at Gateway.
+
+**Box can also apply tool policies to remote calls.** This deployment configures
+the customer endpoint as `[egress.customer]`, so Box evaluates the HTTP route,
+not the individual MCP tool name and arguments. To add that extra layer,
+declare the endpoint as an HTTP server under `[mcp.<name>]`, configure the
+credential route there, and add `mcp:call` and per-tool restrictions using the
+server's discovered schema. Follow the pinned
+[Box MCP policy guide](https://github.com/strands-agents/box/blob/v0.2.2/docs/user/mcp-policy.md)
+and test both allowed and denied calls. Adding a per-tool rule to this sample's
+HTTP allowlist alone does not enable MCP mediation. Ordinary Python tool
+functions inside the worker also do not automatically become Box policy actions.
+
+**Keep history and rule ownership explicit.** Gateway history and Box history
+are separate; AgentCore Memory is a third store and does not populate either
+policy history. This launcher deletes Box state after every turn, so a local
+temporal budget or prerequisite would reset each turn. A longer-lived Box
+workflow needs protected, appropriately scoped state and tests for restart and
+policy-change behavior. Neither a Gateway session nor one Box's history is an
+account-wide quota or a durable approval ledger. Use a trusted shared backend
+for limits or approvals that must survive new sessions and span multiple agents.
+
+The policy schemas also differ: Gateway uses `AgentCore::` tool actions, while
+Box uses `Box::` actions and generated MCP tool actions. Reuse the intent of a
+rule, then adapt and test its schema, event semantics, and history scope at each
+boundary. Prefer one owner for each business rule; add a stricter Box rule when
+this particular agent needs less access.
+
+Finally, distinguish a recorded call from a business decision. This sample's
+Gateway temporal rule matches an eligibility-check response and the order ID;
+it does not inspect the returned `eligible` boolean. In Box, an
+[MCP response event](https://github.com/strands-agents/box/blob/v0.2.2/docs/user/policy/actions.md#what-a-temporal-rule-observes)
+does not by itself establish tool success either. A production return
+workflow should revalidate eligibility in the label tool, or require an
+authoritative approval record, before issuing a label.
+
 ### When this extra layer helps
 
 - **Agents with code, shell, file, or third-party tool access:** you want a
