@@ -9,6 +9,7 @@ import logging
 import os
 
 import boto3
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -28,7 +29,10 @@ _client = None
 def _get_client():
     global _client
     if _client is None:
-        _client = boto3.client("bedrock-agentcore", region_name=REGION)
+        _client = boto3.client(
+            "bedrock-agentcore", region_name=REGION,
+            config=Config(connect_timeout=5, read_timeout=100, retries={"total_max_attempts": 1}),
+        )
     return _client
 
 

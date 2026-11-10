@@ -370,21 +370,25 @@ class ProductionAgentGuardrailsStack(Stack):
         # Package agent code + dependencies using the L2 construct with Docker bundling
         agent_artifact = agentcore.AgentRuntimeArtifact.from_code_asset(
             path=_agent_dir,
-            runtime=agentcore.AgentCoreRuntime.PYTHON_3_11,
-            entrypoint=["agent.py"],
+            runtime=agentcore.AgentCoreRuntime.PYTHON_3_12,
+            entrypoint=["runtime_app.py"],
             bundling=BundlingOptions(
-                image=DockerImage.from_registry("python:3.11-slim"),
+                image=DockerImage.from_registry("python:3.12-slim-bookworm"),
+                platform="linux/arm64",
                 command=["bash", "-c", f"""
                     set -e
                     mkdir -p /tmp/agent-bundle
-                    cp -r /asset-input/* /tmp/agent-bundle/ 2>/dev/null || true
-                    rm -rf /tmp/agent-bundle/__pycache__ /tmp/agent-bundle/.env \
-                           /tmp/agent-bundle/.bedrock_agentcore /tmp/agent-bundle/*.pyc \
-                           /tmp/agent-bundle/basic_agent.py
+                    cp /asset-input/*.py /asset-input/*.dw /asset-input/requirements.txt /tmp/agent-bundle/
+                    rm /tmp/agent-bundle/basic_agent.py
                     cd /tmp/agent-bundle
                     echo "Installing dependencies..."
                     pip install --target /tmp/agent-bundle --upgrade \
                         -r requirements.txt
+                    python3 -c 'import urllib.request; urllib.request.urlretrieve("https://github.com/strands-agents/box/releases/download/v0.2.2/box-v0.2.2-linux-arm64.tar.gz", "/tmp/box.tar.gz")'
+                    echo "7d77f8e261c5c6f4e37c74d77219e9ebb47725f3ced4c29e752c3f51abb789cc  /tmp/box.tar.gz" | sha256sum -c -
+                    mkdir -p /tmp/agent-bundle/box-core
+                    tar -xzf /tmp/box.tar.gz -C /tmp/agent-bundle/box-core
+                    /tmp/agent-bundle/box-core/box --version
                     touch /tmp/agent-bundle/.lock
                     cd /tmp
                     cat > /tmp/create_zip.py << 'PYEOF'
@@ -398,6 +402,7 @@ PYEOF
         self.runtime = agentcore.Runtime(self, "Runtime",
             runtime_name="robot_vacuum_agent",
             agent_runtime_artifact=agent_artifact,
+            platform_version=agentcore.PlatformVersion.V2,
             description="Customer service agent for AnyCompany Robotics",
             environment_variables={
                 "AWS_REGION_NAME": self.region,
@@ -422,8 +427,7 @@ PYEOF
             actions=["ssm:GetParameter", "ssm:GetParameters"],
             resources=[f"arn:aws:ssm:{self.region}:{self.account}:parameter/robot-vacuum/*"]))
         # AgentCore memory and gateway (scoped to specific resources).
-        # DeleteEvent: the Strands context manager compresses conversation
-        # history by rewriting memory events (delete old + create new).
+        # DeleteEvent supports conversation-history edits in the memory adapter.
         self.runtime.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:InvokeGateway", "bedrock-agentcore:CreateEvent",
                      "bedrock-agentcore:GetMemory", "bedrock-agentcore:ListEvents",
@@ -477,6 +481,7 @@ PYEOF
         api = apigw.RestApi(self, "Api",
             rest_api_name="customer-service-api",
             description="REST API with Cognito auth proxying to BFF Lambda",
+            endpoint_types=[apigw.EndpointType.REGIONAL],
             deploy_options=apigw.StageOptions(stage_name="prod", tracing_enabled=True),
         )
 
@@ -510,7 +515,7 @@ PYEOF
 
         # POST /chat → BFF Lambda (Lambda proxy integration)
         chat.add_method("POST",
-            apigw.LambdaIntegration(self.bff_fn),
+            apigw.LambdaIntegration(self.bff_fn, timeout=Duration.seconds(90)),
             authorizer=authorizer,
             authorization_type=apigw.AuthorizationType.COGNITO,
         )

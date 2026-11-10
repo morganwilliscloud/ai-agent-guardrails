@@ -73,7 +73,8 @@ def extract_actor_id(token):
     if not token:
         return "anonymous"
     try:
-        claims = json.loads(base64.b64decode(token.split(".")[1] + "=="))
+        encoded = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
         return claims.get("sub", "anonymous")
     except Exception:
         return "anonymous"
@@ -95,8 +96,8 @@ def get_model():
         cfg = load_config()
         guardrail_id = cfg.get("guardrail-id", "")
         _model = BedrockModel(
-            model_id="us.anthropic.claude-sonnet-5",
-            region_name="us-east-1",
+            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5"),
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
             guardrail_id=guardrail_id if guardrail_id else None,
             guardrail_version="DRAFT" if guardrail_id else None,
             guardrail_trace="enabled" if guardrail_id else None,
@@ -119,7 +120,7 @@ def create_agent(tools, session_id, actor_id):
                     session_id=session_id,
                     actor_id=actor_id,
                 ),
-                region_name="us-east-1",
+                region_name=os.environ.get("AWS_REGION", "us-east-1"),
             )
         except Exception as e:
             logger.warning("Memory setup failed: %s", e)
@@ -129,7 +130,10 @@ def create_agent(tools, session_id, actor_id):
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
         session_manager=session_manager,
-        context_manager="auto",
+        # AgentCoreMemorySessionManager is repository-based. Strands 1.64's
+        # context manager requires snapshot persistence; retain the default
+        # sliding-window conversation manager with this memory integration.
+        context_manager=False,
         plugins=[CustomerServiceSteeringHandler()],
     )
 

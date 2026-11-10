@@ -1,0 +1,49 @@
+// The launcher substitutes exact deployment endpoints. No general Internet,
+// shell, filesystem-interpreter, or tool-spawn permissions are granted.
+@id("service_connections")
+permit(principal == Box::Agent::"self", action == Box::Action::"net:connect", resource)
+when {
+  context.input.port == 443 &&
+  [__MODEL_HOST__, __MEMORY_HOST__, __GATEWAY_HOST__].contains(context.input.host)
+};
+
+@id("model_requests")
+permit(principal == Box::Agent::"self", action == Box::Action::"http:request", resource)
+when {
+  context.input.host == __MODEL_HOST__ &&
+  context.input.method == "POST" &&
+  [__CONVERSE_PATH__, __STREAM_PATH__].contains(context.input.path)
+};
+
+@id("conversation_memory")
+permit(principal == Box::Agent::"self", action == Box::Action::"http:request", resource)
+when {
+  context.input.host == __MEMORY_HOST__ &&
+  ["GET", "POST", "DELETE"].contains(context.input.method) &&
+  (context.input.path == __MEMORY_PATH__ || context.input.path like __MEMORY_CHILDREN__)
+};
+
+@id("customer_gateway")
+permit(principal == Box::Agent::"self", action == Box::Action::"http:request", resource)
+when {
+  context.input.host == __GATEWAY_HOST__ &&
+  context.input.path == "/mcp" &&
+  ["GET", "POST", "DELETE"].contains(context.input.method)
+};
+
+@id("metadata_hosts")
+forbid(principal, action == Box::Action::"net:connect", resource)
+when {
+  context.input.host == "metadata.google.internal" ||
+  context.input.host == "metadata.azure.internal"
+};
+
+@id("metadata_addresses")
+forbid(principal, action == Box::Action::"net:connect", resource)
+when {
+  (context.input has ip4 && context.input.ip4 like "169.254.*") ||
+  (context.input has ip6 && (
+    context.input.ip6 == "fd00:ec2::254" ||
+    context.input.ip6 like "fe8*" || context.input.ip6 like "fe9*" ||
+    context.input.ip6 like "fea*" || context.input.ip6 like "feb*"))
+};
