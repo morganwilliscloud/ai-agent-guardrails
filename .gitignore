@@ -14,9 +14,17 @@ venv/
 # Environment
 .env
 .env.local
+.env.*
+!.env.example
+!.env.*.example
+.aws/
+*.pem
+*.key
 
 # CDK
 cdk/cdk.out/
+cdk.context.json
+cdk-outputs*.json
 
 # AgentCore CLI
 agent/.bedrock_agentcore/
